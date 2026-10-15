@@ -2,16 +2,16 @@ package aweprometheu
 
 import (
 	"context"
-	"log"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 )
 
 var (
 	ctxRoot     context.Context
 	ctxCancelFn context.CancelFunc
-	IsStop      bool
+	IsStop      atomic.Bool
 )
 
 func InitCTX() context.Context {
@@ -29,8 +29,8 @@ func InitCTX() context.Context {
 	{
 		go func() {
 			s := <-sigChan
-			log.Println("Catch signal", s)
-			IsStop = true
+			lg().Info("catch_signal", "signal", s.String())
+			IsStop.Store(true)
 			if ctxRoot != nil {
 				ctxCancelFn()
 			}

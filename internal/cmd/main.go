@@ -1,8 +1,12 @@
 // Command demo — runnable-пример мини-приложения для библиотеки aweprometheu.
 //
 // Что делает:
-//   - поднимает сервер статистики: /metrics, /probes/ready, /probes/live,
-//     их URL печатаются в лог при старте;
+//   - поднимает сервер статистики: /metrics и пробы /probes/ready,
+//     /probes/live на основном порту, плюс те же пробы на отдельных
+//     портах live/ready, отвечающие 200/503 на любой путь; все URL
+//     печатаются в лог при старте;
+//   - логи библиотеки настраиваются отдельно (SetLogger, по умолчанию
+//     slog.Default());
 //   - InitCTX перехватывает SIGHUP/SIGINT/SIGTERM/SIGQUIT и отменяет
 //     корневой контекст — по нему останавливаются воркеры нагрузки;
 //   - гонит синтетическую нагрузку: каждое «обращение к сервису» и каждый
@@ -12,7 +16,9 @@
 //
 //	go run ./internal/cmd
 //
-// затем открыть http://localhost:9099/metrics (порт меняется через DEMO_PORT).
+// затем открыть http://localhost:9099/metrics (порт меняется через
+// DEMO_PORT, порты проб — через DEMO_LIVE_PORT/DEMO_READY_PORT,
+// по умолчанию 9100/9101).
 package main
 
 import (
@@ -28,20 +34,29 @@ import (
 )
 
 func main() {
-	port := os.Getenv("DEMO_PORT")
-	if port == "" {
-		port = "9099"
-	}
+	// Логи библиотеки — отдельная настройка: по умолчанию она пишет через
+	// slog.Default(); SetLogger подменяет логгер (например, на JSON-хендлер
+	// или slog.DiscardHandler, чтобы совсем выключить). Вызов должен идти
+	// до старта stats-сервера, nil возвращает slog.Default().
+	aweprometheu.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+
+	port := envOr("DEMO_PORT", "9099")
+	livePort := envOr("DEMO_LIVE_PORT", "9100")
+	readyPort := envOr("DEMO_READY_PORT", "9101")
 
 	// Старт сервера статистики: регистрирует все семейства метрик в
 	// default-реестре Prometheus и поднимает HTTP-ручки /metrics,
 	// /probes/ready и /probes/live (URL печатаются в лог). Имена семейств
 	// строятся из имени приложения, недопустимые символы экранируются:
-	// demo-app -> demo_app_counter_metrics и т.д.
-	aweprometheu.New("demo-app", "demo", ":"+port)
+	// demo-app -> demo_app_counter_metrics и т.д. Пробы дополнительно
+	// слушают на отдельных портах (live 9100 / ready 9101) и отвечают
+	// 200/503 на любой путь — путь задаётся конфигурацией мониторинга.
+	aweprometheu.NewOnPorts("demo-app", "demo", ":"+port, ":"+livePort, ":"+readyPort)
 
-	// До этого вызова пробы отвечали 503; Ok() переключает флаг живости,
-	// и /probes/live, /probes/ready начинают отвечать 200.
+	// До этого вызова обе пробы отвечали 503; Ok() — по-прежнему одна
+	// команда сразу для live + ready. Раздельные команды OkLive/FailLive
+	// и OkReady/FailReady (их демонстрирует воркер 0 в syntheticLoad)
+	// меняют только свою пробу.
 	aweprometheu.Ok()
 
 	// Корневой контекст процесса: InitCTX подписывается на SIGHUP, SIGINT,
@@ -60,7 +75,14 @@ func main() {
 	// Последняя запись перед выходом: счётчик A="lifecycle" оставляет в
 	// /metrics след того, что завершились штатно, а не упали.
 	aweprometheu.Counter("lifecycle", "shutdown")
-	slog.Info("demo_stopped", "is_stop", aweprometheu.IsStop)
+	slog.Info("demo_stopped", "is_stop", aweprometheu.IsStop.Load())
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 var demoQueries = []string{
@@ -122,6 +144,16 @@ func syntheticLoad(ctx context.Context, workers int) {
 				// апстрима: A="Error", B="timeout", C="upstream".
 				if iter%7 == 0 {
 					aweprometheu.Error("timeout", "upstream")
+				}
+
+				// Раздельное управление пробами: у воркера 0 каждый 50-й
+				// «запрос» на 300 мс снимает готовность. В это время
+				// ready-порт и /probes/ready отвечают 503, а live-проба
+				// остаётся 200 — команды не влияют друг на друга.
+				if id == 0 && iter%50 == 49 {
+					aweprometheu.FailReady()
+					time.Sleep(300 * time.Millisecond)
+					aweprometheu.OkReady()
 				}
 
 				// Имитация SQL-обращения: воркер по очереди «выполняет»

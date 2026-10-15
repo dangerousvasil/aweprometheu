@@ -7,8 +7,11 @@
 - один вызов `New` — подняты `/metrics`, `/probes/live`, `/probes/ready` (URL печатаются в лог);
 - хелперы `Counter`, `CounterAdd`, `Error`, `Gauge`, `Histogram`, `Summary` — без ручного построения лейблов: `app`/`seg` подставляются сами, остальные метки передаются по порядку;
 - отдельные SQL-метрики: `sql_total` и `sql_duration_seconds` с лейблами `sql_query`, `batch` — одной функцией `SetSqlMetrics`;
-- `Ok()`/`Fail()` — переключение проб readiness/liveness (до `Ok()` пробы отвечают 503);
-- `InitCTX()` — корневой контекст, отменяемый по SIGHUP/SIGINT/SIGTERM/SIGQUIT, плюс флаг `IsStop`;
+- `Ok()`/`Fail()` — переключение обеих проб (live + ready) одной командой, до `Ok()` пробы отвечают 503;
+- раздельные команды `OkLive()`/`FailLive()` и `OkReady()`/`FailReady()` — независимое управление пробами;
+- опционально пробы live/ready поднимаются на отдельных портах (`NewOnPorts`) — каждый порт отвечает 200/503 на любой путь;
+- `InitCTX()` — корневой контекст, отменяемый по SIGHUP/SIGINT/SIGTERM/SIGQUIT, плюс атомарный флаг `IsStop`;
+- логирование — отдельная настройка: библиотека везде использует stdlib `log/slog`, по умолчанию `slog.Default()`, подмена — `SetLogger`;
 - версия сборки экспортируется метрикой: из переменной окружения `CI_COMMIT_SHORT_SHA` либо из пакетной переменной `Version`.
 
 ## Установка
@@ -34,7 +37,9 @@ func main() {
 	// Поднимает stats-сервер на :9099: /metrics, /probes/ready, /probes/live.
 	// До Ok() пробы отвечают 503. Повторный вызов игнорируется (warning в лог).
 	aweprometheu.New("my-app", "prod", ":9099")
-	aweprometheu.Ok()
+	// Вариант с отдельными портами проб (live и ready по 200 независимо):
+	// aweprometheu.NewOnPorts("my-app", "prod", ":9099", ":9100", ":9101")
+	aweprometheu.Ok() // одна команда сразу для live + ready
 
 	// Корневой контекст: отменяется по SIGHUP/SIGINT/SIGTERM/SIGQUIT,
 	// при этом выставляется IsStop = true.
@@ -62,8 +67,10 @@ func main() {
 | Путь | Назначение |
 |---|---|
 | `/metrics` | экспорт метрик в текстовом формате Prometheus |
-| `/probes/live` | liveness-проба: 200 после `Ok()`, 503 после `Fail()` |
-| `/probes/ready` | readiness-проба: тот же флаг |
+| `/probes/live` | liveness-проба: 200 после `Ok()`/`OkLive()`, 503 после `Fail()`/`FailLive()` |
+| `/probes/ready` | readiness-проба: 200 после `Ok()`/`OkReady()`, 503 после `Fail()`/`FailReady()` |
+
+При старте через `NewOnPorts` каждая проба дополнительно слушает свой порт (`livePort`, `readyPort`) и отвечает 200/503 на любой путь этого порта — конкретный путь задаётся на стороне мониторинга (например, в k8s-пробе httpGet).
 
 ## Метрики
 
@@ -94,9 +101,24 @@ rate(sql_total{batch="true"}[5m])
 
 ### Запуск
 
-- `New(app, segment, port string)` — поднимает stats-сервер с внутренним флагом живости. Второй вызов (или `Stats` после `New`) игнорируется с warning.
-- `Stats(live *atomic.Bool, app, segment, port string)` — то же, но флаг живости внешний: его можно переключать напрямую через `Store`, минуя `Ok`/`Fail`.
-- `Ok()` / `Fail()` — выставить/сбросить флаг живости. Вызывать только после старта сервера — до него глобальный инстанс ещё nil и вызов паникует.
+- `New(app, segment, port string)` — поднимает stats-сервер: `/metrics`, `/probes/live`, `/probes/ready` на одном порту, флаги проб внутренние. Второй вызов любого стартера игнорируется с warning.
+- `NewOnPorts(app, segment, port, livePort, readyPort string)` — как `New`, но пробы дополнительно слушают на отдельных портах `livePort` и `readyPort`.
+- `Stats(live, ready *atomic.Bool, app, segment, port string)` — то же, что `New`, но флаги проб внешние: их можно переключать напрямую через `Store`, минуя команды ниже.
+- `Ok()` / `Fail()` — выставить/сбросить сразу обе пробы (live + ready).
+- `OkLive()` / `FailLive()`, `OkReady()` / `FailReady()` — управление только своей пробой.
+
+Все команды проб вызывайте после старта сервера — до него глобальный инстанс ещё nil и вызов паникует.
+
+### Логи
+
+Библиотека пишет через стандартный `log/slog`. По умолчанию — `slog.Default()`; `SetLogger` перенаправляет все сообщения библиотеки (stats-сервер, пробы, сигналы, no-op вызовы хелперов) в свой логгер:
+
+```go
+aweprometheu.SetLogger(slog.New(slog.NewJSONHandler(os.Stdout, nil))) // JSON
+aweprometheu.SetLogger(slog.New(slog.DiscardHandler))                 // выключить логи библиотеки
+```
+
+`SetLogger(nil)` возвращает `slog.Default()`. Вызывайте до старта stats-сервера.
 
 ### Запись метрик
 
@@ -113,7 +135,7 @@ rate(sql_total{batch="true"}[5m])
 ### Сигналы и graceful shutdown
 
 - `InitCTX() context.Context` — возвращает корневой контекст и подписывается на SIGHUP, SIGINT, SIGTERM, SIGQUIT. По сигналу выставляется `IsStop = true` и отменяется контекст — все, кто ждёт `ctx.Done()`, завершают работу. Собственный `signal.Notify` в `main` не нужен.
-- `IsStop` читайте только после `<-ctx.Done()` — запись флага упорядочена с закрытием канала Done.
+- `IsStop` — `atomic.Bool`: читать можно в любой момент (`IsStop.Load()`), гарантированно `true` — после `<-ctx.Done()`.
 
 ## Демо
 
@@ -121,7 +143,7 @@ rate(sql_total{batch="true"}[5m])
 go run ./internal/cmd
 ```
 
-Поднимает мини-приложение на `http://localhost:9099` (порт меняется через `DEMO_PORT`): 4 воркера синтетической нагрузки пишут во все семейства метрик, включая ошибки и «SQL-запросы»; Ctrl+C — штатная остановка по контексту от `InitCTX`.
+Поднимает мини-приложение: метрики на `http://localhost:9099` (`DEMO_PORT`), пробы дополнительно на отдельных портах `:9100` live (`DEMO_LIVE_PORT`) и `:9101` ready (`DEMO_READY_PORT`). 4 воркера синтетической нагрузки пишут во все семейства метрик, включая ошибки и «SQL-запросы»; воркер 0 периодически снимает и возвращает готовность (`FailReady`/`OkReady`) — при этом ready отвечает 503, а live остаётся 200. Ctrl+C — штатная остановка по контексту от `InitCTX`.
 
 ## Тесты
 

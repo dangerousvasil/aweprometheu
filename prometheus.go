@@ -2,7 +2,6 @@ package aweprometheu
 
 import (
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -78,7 +77,7 @@ func NewHandler(project, app, seg string) http.Handler {
 // Error increments the counter by 1, accepts up to 3 metrics
 func Error(labels ...string) {
 	if inCounter == nil {
-		slog.Debug(`Errors Inc`, "lbls", labels)
+		lg().Debug(`Errors Inc`, "lbls", labels)
 	} else {
 		inCounter.WithLabelValues(application, segment, `Error`, getLabel(0, labels), getLabel(1, labels), getLabel(2, labels)).Inc()
 	}
@@ -87,7 +86,7 @@ func Error(labels ...string) {
 // Counter increments the counter by 1, accepts up to 4 metrics
 func Counter(labels ...string) {
 	if inCounter == nil {
-		slog.Debug(`CounterVec Inc`, "lbls", labels)
+		lg().Debug(`CounterVec Inc`, "lbls", labels)
 	} else {
 		inCounter.WithLabelValues(application, segment, getLabel(0, labels), getLabel(1, labels), getLabel(2, labels), getLabel(3, labels)).Inc()
 	}
@@ -96,7 +95,7 @@ func Counter(labels ...string) {
 // CounterAdd increments the counter by inc, accepts up to 4 metrics
 func CounterAdd(inc float64, labels ...string) {
 	if inCounter == nil {
-		slog.Debug(`CounterVec Set`, "lbls", labels)
+		lg().Debug(`CounterVec Set`, "lbls", labels)
 	} else {
 		inCounter.WithLabelValues(application, segment, getLabel(0, labels), getLabel(1, labels), getLabel(2, labels), getLabel(3, labels)).Add(inc)
 	}
@@ -105,7 +104,7 @@ func CounterAdd(inc float64, labels ...string) {
 // Gauge set the Gauge in val, accepts up to 4 metrics
 func Gauge(val float64, labels ...string) {
 	if inGauge == nil {
-		slog.Debug(`GaugeVec Set`, "v", val, "lbls", labels)
+		lg().Debug(`GaugeVec Set`, "v", val, "lbls", labels)
 	} else {
 		inGauge.WithLabelValues(application, segment, getLabel(0, labels), getLabel(1, labels), getLabel(2, labels), getLabel(3, labels)).Set(val)
 	}
@@ -114,7 +113,7 @@ func Gauge(val float64, labels ...string) {
 // Histogram set the Histogram in val, accepts up to 4 metrics
 func Histogram(val float64, labels ...string) {
 	if inHistogram == nil {
-		slog.Debug(`HistogramVec Set`, "v", val, "lbls", labels)
+		lg().Debug(`HistogramVec Set`, "v", val, "lbls", labels)
 	} else {
 		inHistogram.WithLabelValues(application, segment, getLabel(0, labels), getLabel(1, labels), getLabel(2, labels), getLabel(3, labels)).Observe(val)
 	}
@@ -123,7 +122,7 @@ func Histogram(val float64, labels ...string) {
 // Summary push to exporter  Summary val, accepts up to 4 metrics
 func Summary(val float64, labels ...string) {
 	if inSummary == nil {
-		slog.Debug(`SummaryVec Set`, "v", val, "lbls", labels)
+		lg().Debug(`SummaryVec Set`, "v", val, "lbls", labels)
 	} else {
 		inSummary.WithLabelValues(application, segment, getLabel(0, labels), getLabel(1, labels), getLabel(2, labels), getLabel(3, labels)).Observe(val)
 	}
@@ -138,7 +137,7 @@ func getLabel(i int, labels []string) string {
 
 func SetSqlMetrics(sql string, startTime time.Time, batch bool) {
 	if sqlRequestDuration == nil {
-		slog.Debug("SetSqlMetrics", "sql", sql, "batch", batch, "s", time.Since(startTime))
+		lg().Debug("SetSqlMetrics", "sql", sql, "batch", batch, "s", time.Since(startTime))
 		return
 	}
 

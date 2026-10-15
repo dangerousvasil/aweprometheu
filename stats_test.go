@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -17,8 +18,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	xslog "golang.org/x/exp/slog"
 )
 
 // The package keeps one global stats server and registers its metric families
@@ -52,21 +51,25 @@ var testPort string
 func TestMiniAppUnderLoad(t *testing.T) {
 	port := freePort(t)
 	testPort = port
+	livePort := freePort(t)
+	readyPort := freePort(t)
 
 	var logs bytes.Buffer
-	prev := xslog.Default()
-	xslog.SetDefault(xslog.New(xslog.NewTextHandler(&logs, nil)))
-	defer xslog.SetDefault(prev)
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(prev)
 
-	Stats(new(atomic.Bool), "mini-app", "test", port)
+	NewOnPorts("mini-app", "test", port, livePort, readyPort)
 	waitHTTP(t, "http://localhost"+port+"/probes/live")
+	waitHTTP(t, "http://localhost"+livePort+"/")
+	waitHTTP(t, "http://localhost"+readyPort+"/")
 
 	t.Run("startup message lists metrics page URLs", func(t *testing.T) {
 		got := logs.String()
 		for _, want := range []string{
 			"http://localhost" + port + "/metrics",
-			"http://localhost" + port + "/probes/ready",
-			"http://localhost" + port + "/probes/live",
+			statsURL(readyPort, "/"),
+			statsURL(livePort, "/"),
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("startup log does not mention %q:\n%s", want, got)
@@ -74,22 +77,65 @@ func TestMiniAppUnderLoad(t *testing.T) {
 		}
 	})
 
-	t.Run("probes follow readiness flag", func(t *testing.T) {
-		if code := probe(t, port, "/probes/live"); code != http.StatusServiceUnavailable {
-			t.Errorf("live probe before Ok(): got %d, want %d", code, http.StatusServiceUnavailable)
-		}
-
-		Ok()
-		for _, path := range []string{"/probes/live", "/probes/ready"} {
-			if code := probe(t, port, path); code != http.StatusOK {
-				t.Errorf("%s after Ok(): got %d, want %d", path, code, http.StatusOK)
+	t.Run("probes follow live/ready flags", func(t *testing.T) {
+		check := func(want int, targets ...[2]string) {
+			t.Helper()
+			for _, tg := range targets {
+				if code := probe(t, tg[0], tg[1]); code != want {
+					t.Errorf("probe %s%s: got %d, want %d", tg[0], tg[1], code, want)
+				}
 			}
 		}
 
+		// До Ok() обе пробы отвечают 503 на любом из своих адресов;
+		// отдельный пробовый порт отвечает на любой путь.
+		check(http.StatusServiceUnavailable,
+			[2]string{port, "/probes/live"},
+			[2]string{port, "/probes/ready"},
+			[2]string{livePort, "/"},
+			[2]string{livePort, "/healthz"},
+			[2]string{readyPort, "/"},
+		)
+
+		// Ok() — одна команда сразу для live + ready.
+		Ok()
+		check(http.StatusOK,
+			[2]string{port, "/probes/live"},
+			[2]string{port, "/probes/ready"},
+			[2]string{livePort, "/"},
+			[2]string{readyPort, "/"},
+		)
+
+		// Раздельные команды действуют только на свою пробу.
+		FailLive()
+		check(http.StatusServiceUnavailable,
+			[2]string{port, "/probes/live"},
+			[2]string{livePort, "/anything"},
+		)
+		check(http.StatusOK,
+			[2]string{port, "/probes/ready"},
+			[2]string{readyPort, "/"},
+		)
+
+		OkLive()
+		FailReady()
+		check(http.StatusOK,
+			[2]string{port, "/probes/live"},
+			[2]string{livePort, "/"},
+		)
+		check(http.StatusServiceUnavailable,
+			[2]string{port, "/probes/ready"},
+			[2]string{readyPort, "/"},
+		)
+
+		OkReady()
 		Fail()
-		if code := probe(t, port, "/probes/live"); code != http.StatusServiceUnavailable {
-			t.Errorf("live probe after Fail(): got %d, want %d", code, http.StatusServiceUnavailable)
-		}
+		check(http.StatusServiceUnavailable,
+			[2]string{port, "/probes/live"},
+			[2]string{port, "/probes/ready"},
+			[2]string{livePort, "/"},
+			[2]string{readyPort, "/"},
+		)
 		Ok()
 	})
 
@@ -126,10 +172,32 @@ func TestMiniAppUnderLoad(t *testing.T) {
 		positive(t, samples, "sql_duration_seconds_count", map[string]string{"batch": "true"}, "sql durations")
 	})
 
-	t.Run("second Stats call is ignored", func(t *testing.T) {
-		Stats(new(atomic.Bool), "other-app", "other", port)
+	t.Run("SetLogger routes library logs", func(t *testing.T) {
+		var buf bytes.Buffer
+		SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+		defer SetLogger(nil)
+
+		// Повторный старт игнорируется и пишет warning — он должен попасть
+		// в настроенный логгер, а не в slog.Default().
+		New("ignored-app", "ignored", freePort(t))
+		if !strings.Contains(buf.String(), "second_attempt_starting_stats") {
+			t.Errorf("library warning did not go to the configured logger:\n%s", buf.String())
+		}
+	})
+
+	t.Run("second Stats/NewOnPorts call is ignored", func(t *testing.T) {
+		otherLive, otherReady := freePort(t), freePort(t)
+		Stats(new(atomic.Bool), new(atomic.Bool), "other-app", "other", freePort(t))
+		NewOnPorts("other-app", "other", freePort(t), otherLive, otherReady)
 		if code := probe(t, port, "/metrics"); code != http.StatusOK {
-			t.Errorf("/metrics after second Stats call: got %d, want %d", code, http.StatusOK)
+			t.Errorf("/metrics after second start call: got %d, want %d", code, http.StatusOK)
+		}
+		// Игнорируемый повторный старт не должен поднимать пробовые серверы.
+		if !refused(t, otherLive, "/") {
+			t.Errorf("ignored NewOnPorts started a live probe server on %s", otherLive)
+		}
+		if !refused(t, otherReady, "/") {
+			t.Errorf("ignored NewOnPorts started a ready probe server on %s", otherReady)
 		}
 	})
 }
@@ -146,7 +214,7 @@ func TestInitCTX(t *testing.T) {
 	if err := ctx.Err(); err != nil {
 		t.Errorf("свежий контекст уже отменён: %v", err)
 	}
-	if IsStop {
+	if IsStop.Load() {
 		t.Error("IsStop = true до получения сигнала")
 	}
 
@@ -197,9 +265,9 @@ func TestInitCTX(t *testing.T) {
 	if err := ctx.Err(); !errors.Is(err, context.Canceled) {
 		t.Errorf("ctx.Err() = %v, want context.Canceled", err)
 	}
-	// IsStop записывается ДО отмены контекста, поэтому читать его безопасно
-	// только после <-ctx.Done() выше (упорядочивание через close канала Done).
-	if !IsStop {
+	// IsStop — atomic.Bool, читать можно в любой момент; гарантированно
+	// true — после <-ctx.Done() выше (Store идёт до отмены контекста).
+	if !IsStop.Load() {
 		t.Error("IsStop = false после сигнала")
 	}
 
@@ -339,6 +407,18 @@ func probe(t *testing.T, port, path string) int {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode
+}
+
+// refused — соединение на адрес должно отклоняться: игнорируемый
+// повторный старт библиотеки не должен поднимать новые серверы.
+func refused(t *testing.T, port, path string) bool {
+	t.Helper()
+	resp, err := http.Get("http://localhost" + port + path)
+	if err != nil {
+		return true
+	}
+	resp.Body.Close()
+	return false
 }
 
 func scrape(t *testing.T, port string) (body, contentType string) {

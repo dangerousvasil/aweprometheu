@@ -2,10 +2,7 @@ module github.com/dangerousvasil/aweprometheu
 
 go 1.27.2
 
-require (
-	github.com/prometheus/client_golang v1.25.0
-	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e
-)
+require github.com/prometheus/client_golang v1.25.0
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
